@@ -42,8 +42,7 @@ PRIVATE_NAMESPACE_BEGIN
 
 // -----------------------
 
-constexpr int LUT_SIZE = 6;
-dict<SigBit, Cell*> bit2driver;
+
 struct CutInfo {
     std::vector<SigBit> inputs;
     SigBit output;
@@ -62,12 +61,23 @@ bool MapperMain(Module *module);
 void SetPangoCellTypes(CellTypes *);
 void BuildBit2CutInfo(Module *module);
 bool Bit2oCut_FromBit2CutInfo();
-bool Cone2ToLUTs(Module *module,
-                dict<SigBit, pool<SigBit>> &bit2cut,
-                dict<std::pair<SigBit,SigBit>, pool<SigBit>> &twoOutputCuts);
+bool Cone2ToLUTs(Module *module);
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
 
 
+RTLIL::Cell* getDriver(Module *module, const SigBit &bit) {
+    for (auto &p : module->cells_) {
+        Cell *c = p.second;
+        for (auto &port : c->connections()) {
+            for (auto &sig : port.second) {
+                if (sig == bit)
+                    return c;
+            }
+        }
+    }
+    log_error("No driver found for %s\n", log_signal(bit));
+    return nullptr; // 永远不会执行到这里
+}
 
 SigBit GetCellOutput(Cell *cell)
 {
@@ -218,7 +228,7 @@ bool MapperMain(Module *module)
         sigmap.set(module);
 		BuildBit2CutInfo(module);
 		Bit2oCut_FromBit2CutInfo();
-
+		Cone2ToLUTs(module);
         return true;
 }
 
@@ -308,117 +318,6 @@ void BuildBit2CutInfo(Module *module)
 
     log("BuildBit2CutInfo: total LUTs = %d\n", GetSize(bit2cutinfo));
 }
-bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
-{
-    bit2cut.clear();
-    pool<SigBit> primary_inputs;
-    pool<Cell*> topo_cells;
-
-    // 遍历电路，找出 primary input（无驱动）
-    for (auto &p : bit2cutinfo) {
-        for (auto in : p.second.inputs)
-            if (!bit2cutinfo.count(in))
-                primary_inputs.insert(in);
-    }
-
-    // 初始化 PI cut
-    for (auto &pi : primary_inputs)
-        bit2cut[pi].insert(pi);
-
-    // 拓扑遍历（假设 bit2cutinfo 已是 DAG）
-    std::queue<SigBit> q;
-    for (auto &p : bit2cutinfo)
-        q.push(p.first);
-
-    while (!q.empty()) {
-        SigBit out = q.front();
-        q.pop();
-
-        const CutInfo &ci = bit2cutinfo[out];
-        pool<SigBit> merged_cut;
-        for (auto in : ci.inputs) {
-            merged_cut.insert(bit2cut[in].begin(), bit2cut[in].end());
-        }
-
-        // 限制 cut 大小不超过 6
-        while (merged_cut.size() > 6) {
-            // 剪枝策略：删除扇出最小或随机节点
-            merged_cut.erase(merged_cut.begin());
-        }
-
-        bit2cut[out] = merged_cut;
-    }
-
-    log("Bit2oCut: total cuts = %d\n", GetSize(bit2cut));
-    return true;
-}
-
-State StateEval(const dict<SigBit, State> &assign, SigBit bit)
-{
-    // 已赋值直接返回
-    if (assign.count(bit))
-        return assign.at(bit);
-
-    // 如果 bit 是常量
-    if (bit == State::S0) return State::S0;
-    if (bit == State::S1) return State::S1;
-
-    // 从 bit2cutinfo 查找驱动 LUT
-    if (!bit2cutinfo.count(bit))
-        return State::Sx; // 无定义
-
-    const CutInfo &ci = bit2cutinfo.at(bit);
-    int k = ci.inputs.size();
-
-    int idx = 0;
-    for (int i = 0; i < k; i++) {
-        State s = StateEval(assign, ci.inputs[i]);
-        if (s == State::Sx) return State::Sx;
-        if (s == State::S1)
-            idx |= (1 << i);
-    }
-
-   return ci.init[idx];
-
-
-
-}
-std::vector<bool> GetCutInit(const std::vector<SigBit> &cut, SigBit output)
-{
-    int n = cut.size();
-    int mask_num = 1 << n;
-    std::vector<bool> init(mask_num);
-
-    for (int m = 0; m < mask_num; ++m) {
-        dict<SigBit, State> assign;
-        for (int i = 0; i < n; i++)
-            assign[cut[i]] = ((m >> i) & 1) ? State::S1 : State::S0;
-
-        State val = StateEval(assign, output);
-        init[m] = (val == State::S1);
-    }
-    return init;
-}
-bool IsCombinationalGate(Cell *cell)
-{
-    static const pool<IdString> seq_types = {
-        ID(GTP_DFF), ID(GTP_DFF_C), ID(GTP_DFF_R),
-        ID(GTP_DFF_S), ID(GTP_DLATCH), ID(GTP_RAM32X1SP),
-        ID(GTP_RAM64X1SP)
-    };
-
-    if (seq_types.count(cell->type))
-        return false;
-
-    if (cell->type.str().find("LUT") != std::string::npos)
-        return true;
-
-    if (cell->type.str().find("BUF") != std::string::npos)
-        return false;
-
-    // 默认认为有输入输出的纯组合门
-    return cell->hasPort(ID(A)) || cell->hasPort(ID(I));
-}
 
 
 bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2)
@@ -466,58 +365,70 @@ int SortCutLevel(const vector<Cell*> &cells_in_level,
 //枚举并按边存储可行性对
 //图算法求得最优组队并存入twoOutputCuts
 // 全局结构
-
 bool Bit2oCut_FromBit2CutInfo()
 {
-    log("Bit2oCut_FromBit2CutInfo: entry, total LUTs = %d\n", GetSize(bit2cutinfo));
+    log("Bit2oCut_FromBit2CutInfo_MaxMatching: entry, total LUTs = %d\n", GetSize(bit2cutinfo));
     twoOutputCuts.clear();
+    pool<SigBit> fused_outputs;
 
-    // 将所有项转为 vector 方便遍历
-    std::vector<std::pair<SigBit, CutInfo>> entries(bit2cutinfo.begin(), bit2cutinfo.end());
-    int n = entries.size();
+    // 1️⃣ 将 bit2cutinfo 转成 vector 方便索引
+    std::vector<SigBit> outs;
+    std::vector<std::vector<SigBit>> cuts;
+    for (auto &p : bit2cutinfo) {
+        outs.push_back(p.first);
+        cuts.push_back(p.second.inputs);
+    }
+    int n = outs.size();
 
-    int merge_cnt = 0;
+    // 2️⃣ 构建图的邻接表和边对应的融合 cut
+    std::vector<std::vector<int>> adj(n);
+    std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut;
 
-    for (int i = 0; i < n; i++) {
-        const auto &A = entries[i].second;
-        const std::vector<SigBit> &inA = A.inputs;
-		if(inA.size()==6) continue;
-        for (int j = i + 1; j < n; j++) {
-            const auto &B = entries[j].second;
-            const std::vector<SigBit> &inB = B.inputs;
-						if(inB.size()==6) continue;
-            // 计算交集
+    for (int i = 0; i < n; ++i) {
+        if (cuts[i].size() == 6) continue;
+        for (int j = i + 1; j < n; ++j) {
+            if (cuts[j].size() == 6) continue;
+
+            // 检查是否有共享输入
             bool has_common = false;
-            for (auto &a : inA)
-                for (auto &b : inB)
-                    if (a == b) { has_common = true; break; }
+            for (auto &a : cuts[i]) for (auto &b : cuts[j])
+                if (a == b) { has_common = true; break; }
             if (!has_common) continue;
 
-            // 构造输入并集
-            std::vector<SigBit> merged = inA;
-            for (auto &b : inB)
-                if (std::find(merged.begin(), merged.end(), b) == merged.end())
-                    merged.push_back(b);
+            // 构建融合 cut
+            pool<SigBit> merged(cuts[i].begin(), cuts[i].end());
+            merged.insert(cuts[j].begin(), cuts[j].end());
+            if (merged.size() > 5) continue;
 
-            // 限制：最多6输入
-            if ((int)merged.size() > 5) continue;
+            // 添加到邻接表
+            adj[i].push_back(j);
+            adj[j].push_back(i);
 
-            // 记录融合
-            twoOutputCuts[{A.output, B.output}] = merged;
-            merge_cnt++;
-
-            // 调试输出
-          //  log("  [FUSE] %s + %s -> merged_inputs(%d):",
-                // log_signal(A.output), log_signal(B.output), (int)merged.size());
-            // for (auto &m : merged) log(" %s", log_signal(m));
-            // log("\n");
-
-            // 一个输出只参与一次融合（可改）
-            break;
+            edgeMergedCut[{i,j}] = merged;
         }
     }
 
-    log("Bit2oCut_FromBit2CutInfo: total merged pairs = %d\n", merge_cnt);
+    // 3️⃣ 最大匹配
+    auto [mate, match_pairs] = max_matching(adj); // 你的现有 max_matching 函数
+    log("Bit2oCut: found %d merge pairs\n", match_pairs);
+
+    // 4️⃣ 将匹配结果写入 twoOutputCuts
+    for (int i = 0; i < n; ++i) {
+        int j = mate[i];
+        if (j == -1 || i > j) continue; // 只处理 i < j 的边
+
+        auto it = edgeMergedCut.find({i,j});
+        if (it == edgeMergedCut.end()) continue;
+
+        // pool 转 vector
+        std::vector<SigBit> merged_vec(it->second.begin(), it->second.end());
+        twoOutputCuts[{outs[i], outs[j]}] = merged_vec;
+
+        fused_outputs.insert(outs[i]);
+        fused_outputs.insert(outs[j]);
+    }
+
+    log("Bit2oCut_FromBit2CutInfo_MaxMatching: total merged pairs = %zu\n", twoOutputCuts.size());
     return true;
 }
 
@@ -2426,252 +2337,139 @@ void SetPangoCellTypes(CellTypes *ct)
 }
 
 
+RTLIL::Cell *addSingleOutputLut(Module *module, const SigBit &out) {
+    CutInfo &cutinfo = bit2cutinfo[out];
+    const std::vector<SigBit> &vcut = cutinfo.inputs;
+    log_assert(!vcut.empty() && vcut.size() <= 6);
 
-RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit &sig_z)
-{
-	log_assert(cut.size() <= LUT_SIZE && cut.size() >= 1);
-	vector<SigBit> vcut;
-	for (auto bit : cut) {
-		vcut.push_back(bit);
-	}
-	vector<bool> cut_init_bools = GetCutInit(vcut, sig_z);
-	Cell *drv = bit2driver[sig_z];
-	log_assert(drv);
-	IdString name = drv->name;
-	string new_name = string(name.c_str()) + "_lut";
-	Cell *cell = nullptr;
-	if (using_internel_lut_type) {
-		// instantiate $lut, need call techmap pass
-		cell = module->addCell(IdString(new_name), ID($lut));
-		cell->parameters[ID::WIDTH] = RTLIL::Const(vcut.size());
-		cell->parameters[ID::LUT] = RTLIL::Const(cut_init_bools);
+    // 获取驱动
+    Cell *drv = getDriver(module, out);
+    log_assert(drv);
+static std::unordered_map<std::string,int> lut_name_counter;
+std::string base_name = std::string(drv->name.c_str()) + "_lut";
+int &count = lut_name_counter[base_name];
+std::string new_name = base_name + "_" + std::to_string(count++);
+    Cell *cell = nullptr;
 
-		cell->setPort(ID(A), vcut);
-		cell->setPort(ID(Y), sig_z);
-		cell->set_src_attribute(drv->get_src_attribute());
-	} else {
-		IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3), ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
-		cell = module->addCell(RTLIL::IdString(new_name), types[vcut.size() - 1]);
-		cell->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
-		for (size_t i = 0; i < vcut.size(); ++i) {
-			string pin_name = "\\I" + to_string(i);
-			cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
-		}
-		cell->setPort(ID(Z), sig_z);
-		cell->set_src_attribute(drv->get_src_attribute());
-	}
-	return cell;
+    // 直接映射到 GTP_LUT1~6
+    IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3),
+                        ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
+    cell = module->addCell(RTLIL::IdString(new_name), types[vcut.size() - 1]);
+    cell->parameters[ID::INIT] = cutinfo.init;
+
+    for (size_t i = 0; i < vcut.size(); ++i) {
+        std::string pin_name = "\\I" + std::to_string(i);
+        cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
+    }
+    cell->setPort(ID(Z), out);
+    cell->set_src_attribute(drv->get_src_attribute());
+
+    return cell;
 }
 
-RTLIL::Cell* addDualOutputLut(Module *module,
-                              const pool<SigBit> &merged_cut,
-                              const std::vector<SigBit> &outputs,
-                              dict<SigBit, pool<SigBit>> &bit2cut)
-{
-    if (outputs.size() != 2 || merged_cut.empty() || merged_cut.size() > 6)
+RTLIL::Cell* addDualOutput(Module *module,
+                                         const std::pair<SigBit,SigBit> &outputs_pair) {
+    SigBit out1 = outputs_pair.first;
+    SigBit out2 = outputs_pair.second;
+
+    CutInfo &cut1 = bit2cutinfo[out1];
+    CutInfo &cut2 = bit2cutinfo[out2];
+
+    // 只处理两个小于6输入的cut
+    if (cut1.inputs.size() > 5 || cut2.inputs.size() > 5)
         return nullptr;
 
-    SigBit out_a = outputs[0];
-    SigBit out_b = outputs[1];
-    pool<SigBit> cut_a = bit2cut[out_a];
-    pool<SigBit> cut_b = bit2cut[out_b];
-
-    auto sanitize_cut = [&](const pool<SigBit> &cut) {
-        pool<SigBit> clean;
-        for (auto bit : cut) {
-            if (bit == out_a || bit == out_b)
-                continue;
-            clean.insert(bit);
-        }
-        return clean;
-    };
-
-    cut_a = sanitize_cut(cut_a);
-    cut_b = sanitize_cut(cut_b);
-
-    bool a_is6 = cut_a.size() == 6;
-    bool b_is6 = cut_b.size() == 6;
-
-    SigBit out_z = out_b;
-    SigBit out_z5 = out_a;
-    pool<SigBit> cut_z = cut_b;
-    pool<SigBit> cut_z5 = cut_a;
-
-    if (a_is6 && !b_is6) {
-        out_z = out_a;
-        out_z5 = out_b;
-        cut_z = sanitize_cut(cut_a);
-        cut_z5 = sanitize_cut(cut_b);
-    } else if (b_is6 && !a_is6) {
-        out_z = out_b;
-        out_z5 = out_a;
-         cut_z = sanitize_cut(cut_b);
-        cut_z5 = sanitize_cut(cut_a);
-    } else if (a_is6 && b_is6) {
-        // 当前不支持 6PI + 6PI 融合
-        return nullptr;
+    // 找到共享输入
+    std::vector<SigBit> pins;
+    std::map<SigBit,int> pin_index;
+    for (auto &bit : cut1.inputs) {
+        if (std::find(cut2.inputs.begin(), cut2.inputs.end(), bit) != cut2.inputs.end())
+            pins.push_back(bit);
+    }
+    // 添加 cut1 独立输入
+    for (auto &bit : cut1.inputs) {
+        if (std::find(pins.begin(), pins.end(), bit) == pins.end())
+            pins.push_back(bit);
+    }
+    // 添加 cut2 独立输入
+    for (auto &bit : cut2.inputs) {
+        if (std::find(pins.begin(), pins.end(), bit) == pins.end())
+            pins.push_back(bit);
     }
 
-    dict<SigBit, int> pin_index;
-    std::vector<SigBit> pins;
-
-    bool share_inputs = false;
-    for (auto bit : cut_z5)
-        if (cut_z.count(bit)) {
-            share_inputs = true;
-            break;
-        }
-
-    if (!share_inputs)
+    if (pins.size() > 5)
         return nullptr;
 
-     auto add_cut_bits_unique = [&](const pool<SigBit> &cut) {
-        for (auto bit : cut) {
-            if (!pin_index.count(bit)) {
-                pin_index[bit] = pins.size();
-                pins.push_back(bit);
-            }
-        }
-    };
-
-    add_cut_bits_unique(cut_z5);
-    add_cut_bits_unique(cut_z);
-
-    if (pins.size() > 6)
-        return nullptr;
-
-    size_t input_count = pins.size();
-    bool z_uses_6_inputs = cut_z.size() == 6;
-
+    // 构建融合后的 init64
     std::vector<bool> init64(64, false);
+    size_t input_count = pins.size();
     size_t comb_limit = 1ull << input_count;
     for (size_t mask = 0; mask < comb_limit; ++mask) {
-        dict<SigBit, State> assignment;
-        for (size_t i = 0; i < input_count; ++i)
-            assignment[pins[i]] = ((mask >> i) & 1) ? State::S1 : State::S0;
-
-        State val_z = StateEval(assignment, out_z);
-        State val_z5 = StateEval(assignment, out_z5);
-        if (val_z == State::Sx || val_z5 == State::Sx)
-            log_error("Cannot evaluate dual-output LUT for %s/%s.\n",
-                      log_signal(out_z), log_signal(out_z5));
-
-        int idx_base = 0;
-        int o5_inputs = std::min<size_t>(5, input_count);
-        for (int i = 0; i < o5_inputs; ++i)
-            if ((mask >> i) & 1)
-                idx_base |= (1 << i);
-
-        if (!z_uses_6_inputs) {
-            // 两个输出均为 ≤5 输入：I5 接 1，使主输出使用上半区
-            init64[idx_base | (1 << 5)] = (val_z == State::S1);
-        } else {
-            // 6 输入 + 5 输入：第 6 个输入位作为 I5
-            bool i5_val = (mask >> 5) & 1;
-            init64[idx_base | (i5_val << 5)] = (val_z == State::S1);
-        }
-
-        // 仅在 I5=0 平面写入 5 输入函数
-        if (!z_uses_6_inputs || ((mask >> 5) & 1) == 0)
-            init64[idx_base] = (val_z5 == State::S1);
-    }
-
-    auto eval_from_init = [&](bool is_z, size_t mask) {
         size_t idx_base = 0;
-        size_t o5_inputs = std::min<size_t>(5, input_count);
-        for (size_t i = 0; i < o5_inputs; ++i)
-            if ((mask >> i) & 1)
-                idx_base |= (1 << i);
+        for (size_t i = 0; i < input_count; ++i)
+            if ((mask >> i) & 1) idx_base |= (1 << i);
 
-        if (!is_z)
-            return init64[idx_base];
+        // cut1 输出对齐到低 5 位
+        bool val1 = cut1.init[mask];
+        init64[idx_base] = val1;
 
-        if (!z_uses_6_inputs)
-            return init64[idx_base | (1 << 5)];
-
-        bool i5_val = (mask >> 5) & 1;
-        return init64[idx_base | (i5_val << 5)];
-    };
-
-    auto depends_on_pin = [&](bool is_z, size_t pin_idx) {
-        if (!is_z && pin_idx >= 5)
-            return false;
-
-        for (size_t mask = 0; mask < comb_limit; ++mask) {
-            if ((mask >> pin_idx) & 1)
-                continue;
-
-            size_t mask1 = mask | (1ull << pin_idx);
-            bool v0 = eval_from_init(is_z, mask);
-            bool v1 = eval_from_init(is_z, mask1);
-            if (v0 != v1)
-                return true;
-        }
-        return false;
-    };
-
-    size_t shared_dependencies = 0;
-    for (size_t idx = 0; idx < input_count; ++idx) {
-        bool z_dep = depends_on_pin(true, idx);
-        bool z5_dep = depends_on_pin(false, idx);
-        if (z_dep && z5_dep)
-            ++shared_dependencies;
+        // cut2 输出写到低 5 位平面，对应 I5=1
+        bool val2 = cut2.init[mask];
+        init64[idx_base | (1 << 5)] = val2;
     }
 
-    if (shared_dependencies == 0)
-        return nullptr;
-
-    Cell *drv = bit2driver[out_z];
+    // 取驱动
+    Cell *drv = getDriver(module, out1);
     log_assert(drv);
-    IdString drv_name = drv->name;
-    std::string new_name = std::string(drv_name.c_str()) + "_lut6d";
+    static std::unordered_map<std::string,int> lut6d_name_counter;
+std::string base_name = std::string(drv->name.c_str())  + "_lut6d";
+int &count = lut6d_name_counter[base_name];
+std::string new_name = base_name + "_" + std::to_string(count++);
+
+
     Cell *cell = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
 
-    for (size_t i = 0; i < input_count && i < 6; ++i) {
+    // 设置输入端口
+    for (size_t i = 0; i < input_count; ++i) {
         std::string pin_name = "\\I" + std::to_string(i);
         cell->setPort(RTLIL::IdString(pin_name), pins[i]);
     }
-
+    // 填充空位到 I4
     for (size_t i = input_count; i < 5; ++i) {
         std::string pin_name = "\\I" + std::to_string(i);
-        cell->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(0, 1)));
+        cell->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(0,1)));
     }
+    // I5 固定为 1
+    cell->setPort(RTLIL::IdString("\\I5"), RTLIL::SigSpec(RTLIL::Const(1,1)));
 
-    if (z_uses_6_inputs) {
-        log_assert(input_count == 6);
-        cell->setPort(RTLIL::IdString("\\I5"), pins[5]);
-    } else {
-        cell->setPort(RTLIL::IdString("\\I5"), RTLIL::SigSpec(RTLIL::Const(1, 1)));
-    }
+    // 输出端口
+    cell->setPort(ID(Z), out2);   // 主输出对应 I5=1 的平面
+    cell->setPort(ID(Z5), out1);  // 副输出对应 I5=0 的平面
 
-    cell->setPort(ID(Z), out_z);
-    cell->setPort(ID(Z5), out_z5);
+    // 设置 INIT
     cell->parameters[ID::INIT] = RTLIL::Const(init64);
     cell->set_src_attribute(drv->get_src_attribute());
 
     return cell;
 }
 
-bool Cone2ToLUTs(Module *module,
-                dict<SigBit, pool<SigBit>> &bit2cut,
-                dict<std::pair<SigBit,SigBit>, pool<SigBit>> &twoOutputCuts)
+
+
+bool Cone2ToLUTs(Module *module)
 {
     static size_t vf_count = 0;
+    pool<SigBit> fused_outputs;
 
- pool<SigBit> fused_outputs;
-
-    // 1️⃣ 先处理 dual-output cut
+    // 1️⃣ 处理 dual-output cut
     for (auto &p : twoOutputCuts) {
         vf_count++;
         SigBit out1 = p.first.first;
         SigBit out2 = p.first.second;
-        pool<SigBit> &inputs = p.second;
-
-        std::vector<SigBit> outputs = {out1, out2};
-        Cell *lut = addDualOutputLut(module, inputs, outputs,bit2cut); // 需要实现 dual-output addLut
+		pair<SigBit,SigBit> outputs_pair ={out1,out2};
+        Cell *lut = addDualOutput(module,outputs_pair ); // 使用全局 twoOutputCuts + bit2cutinfo
         if (!lut) {
-           // log_warning("Bit2oCut: dual-output LUT build failed for %s/%s, falling back to single-output mapping.\n",
-            //            log_signal(out1), log_signal(out2));
+            // log_warning("Dual-output LUT build failed for %s/%s, fallback to single-output mapping.\n",
+            //             log_signal(out1), log_signal(out2));
             continue;
         }
 
@@ -2679,31 +2477,73 @@ bool Cone2ToLUTs(Module *module,
         fused_outputs.insert(out2);
     }
 
-    // 2️⃣ 再处理剩余的单输出 cut
-    for (auto &p : bit2cut) {
+    // 2️⃣ 处理剩余单输出 cut
+    for (auto &p : bit2cutinfo) {
         SigBit out = p.first;
 
-        // 已经在 dual-output 中处理过的输出就跳过
         if (fused_outputs.count(out))
             continue;
 
-        pool<SigBit> cut = p.second;
-        Cell *lut = addLut(module, cut, out); // 单输出 LUT
+        CutInfo &cutinfo = p.second;
+        Cell *lut = addSingleOutputLut(module,  out); // 单输出 GTP_LUT
         log_assert(lut);
     }
 
-    // 3️⃣ 删除原始组合逻辑门
-    for (auto c : module->cells_) {
-        if (IsCombinationalGate(c.second)) {
-            module->remove(c.second);
+    // 3️⃣ 删除原组合逻辑门
+    std::vector<Cell*> to_remove;
+    for (auto &c : module->cells_) {
+        IdString type = c.second->type;
+        if (type == ID($_AND_) || type == ID($_OR_) || type == ID($_NOT_) ||
+            type == ID($_XOR_) || type == ID($_MUX_)||type == ID($lut)) {
+            to_remove.push_back(c.second);
         }
     }
+    for (auto c : to_remove)
+        module->remove(c);
 
     return true;
 }
 
 
 
+// struct MapperPass : public Pass {
+// 	MapperPass() : Pass("mapper", "synthesis for Pango FPGA. Mapper main function.") {}
+// 	void help() override
+// 	{
+// 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+// 		log("\n");
+// 		log("    mapper [options] [selection]\n");
+// 	}
+// 	bool write_out_black_list;
+// 	void clear_flags() override { write_out_black_list = false; }
+// 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+// 	{
+// 		log_header(design, "Start MapperPass\n");
+
+// 		size_t argidx;
+// 		for (argidx = 1; argidx < args.size(); argidx++) {
+// 			if (args[argidx] == "-ilut") {
+// 				using_internel_lut_type = true;
+// 				continue;
+// 			}
+// 			if (args[argidx] == "-interation" && argidx + 1 < args.size()) {
+// 				MAX_INTERATIONS = max(atoi(args[++argidx].c_str()), 3);
+// 				continue;
+// 			}
+// 			break;
+// 		}
+// 		extra_args(args, argidx, design);
+
+// 		Module *module = design->top_module();
+// 		if (module == nullptr)
+// 			log_cmd_error("No top module found.\n");
+
+// 		log_header(design, "Continuing MapperPass pass.\n");
+// 		MapperInit(module);
+// 		MapperMain(module);
+// 		log_pop();
+// 	}
+// } MapperPass;
 
 struct testpass:public ScriptPass{
 	testpass():ScriptPass("test_pango","just test"){}
@@ -2742,5 +2582,101 @@ struct testpass:public ScriptPass{
 }testpass;
 
 
+// struct SynthPangoPass : public ScriptPass {
+// 	SynthPangoPass() : ScriptPass("synth_pango", "synthesis script pass for Pango FPGA. Map gate to GTP_LUT.") {}
+// 	void help() override
+// 	{
+// 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+// 		log("\n");
+// 		log("    synth_pango [options] [selection]\n");
+// 	}
 
+// 	string input_verilog_file;
+// 	string output_verilog_file;
+// 	string top_module_name;
+// 	void clear_flags() override
+// 	{
+// 		using_internel_lut_type = false;
+// 		output_verilog_file = "";
+// 		top_module_name = "";
+// 	}
+// 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+// 	{
+// 		string run_from, run_to;
+// 		clear_flags();
+
+// 		size_t argidx;
+// 		for (argidx = 1; argidx < args.size(); argidx++) {
+// 			if (args[argidx] == "-top" && argidx + 1 < args.size()) {
+// 				top_module_name = args[++argidx];
+// 				continue;
+// 			}
+// 			if (args[argidx] == "-input" && argidx + 1 < args.size()) {
+// 				input_verilog_file = args[++argidx];
+// 				continue;
+// 			}
+// 			if (args[argidx] == "-interation" && argidx + 1 < args.size()) {
+// 				MAX_INTERATIONS = max(atoi(args[++argidx].c_str()), 3);//
+// 				continue;
+// 			}
+// 			if (args[argidx] == "-run" && argidx + 1 < args.size()) {
+// 				size_t pos = args[argidx + 1].find(':');
+// 				if (pos == std::string::npos)
+// 					break;
+// 				run_from = args[++argidx].substr(0, pos);
+// 				run_to = args[argidx].substr(pos + 1);
+// 				continue;
+// 			}
+// 			break;
+// 		}
+
+// 		extra_args(args, argidx, design);
+// 		if (!design->full_selection())
+// 			log_cmd_error("This command only operates on fully selected designs!\n");
+
+// 		log_header(design, "Start synth_pango\n");
+// 		log_push();
+
+// 		run_script(design, run_from, run_to);
+
+// 		log_pop();
+// 	}
+// 	void script() override
+// 	{
+// 		if (check_label("begin")) {
+// #if defined(_WIN32)
+// 			//run("read_verilog -lib ./techlibs/pango/pango_lib.v");
+// #else
+// 			run("read_verilog -lib +/pango/pango_lib.v");
+// #endif
+// 			run(stringf("read_verilog -icells %s", input_verilog_file.c_str()));
+// 			if (top_module_name.size() > 0) {
+// 				run(stringf("hierarchy -check -top %s", top_module_name.c_str()));
+// 			}
+// 		}
+
+// 		Module *module = active_design->top_module();
+// 		if (module == nullptr)
+// 			log_cmd_error("No top module found.\n");
+// 		if (top_module_name.size() == 0) {
+// 			top_module_name = module->name.c_str();
+// 		}
+
+// 		if (check_label("pango")) {
+// 			run(stringf("hierarchy -check -top %s;;", top_module_name.c_str()));
+// 			run("synth");
+// 			MapperInit(module);
+// 			MapperMain(module);
+// 		}
+// 		if (check_label("check")) {
+// 			run("check -mapped");
+// 		}
+// 		if (check_label("verilog")) {
+// 			run(stringf("write_verilog -noexpr -noattr %s_syn.v", top_module_name.c_str() + 1));
+// 		}
+// 		if (check_label("score")) {
+// 			run(stringf("score -before %s -after %s_syn.v", input_verilog_file.c_str(), top_module_name.c_str() + 1));
+// 		}
+// 	}
+// } SynthPangoPass;
 PRIVATE_NAMESPACE_END
