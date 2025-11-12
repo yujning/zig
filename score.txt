@@ -1,0 +1,4 @@
+cost : 0
+max_level : 17
+num_of_luts : 0
+num_of_pins : 0
